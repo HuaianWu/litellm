@@ -1,0 +1,5 @@
+FROM docker.litellm.ai/berriai/litellm:1.99.1
+
+COPY litellm/proxy/proxy_server.py /app/.venv/lib/python3.13/site-packages/litellm/proxy/proxy_server.py
+
+RUN python -m py_compile /app/.venv/lib/python3.13/site-packages/litellm/proxy/proxy_server.py
