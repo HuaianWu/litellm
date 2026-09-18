@@ -3887,6 +3887,50 @@ async def _seed_max_parallel_requests_slots(
     )
 
 
+@pytest.mark.asyncio
+async def test_completed_post_call_releases_parallel_slot_v3():
+    api_key = hash_token("sk-completed-post-call")
+    local_cache = DualCache()
+    handler = _PROXY_MaxParallelRequestsHandler(
+        internal_usage_cache=InternalUsageCache(local_cache)
+    )
+    user_api_key_dict = UserAPIKeyAuth(api_key=api_key, max_parallel_requests=1)
+    data: Dict[str, Any] = {
+        "model": "auto_model/urm",
+        "litellm_call_id": "completed-owner",
+    }
+    parallel_key = f"{{api_key:{api_key}}}:max_parallel_requests"
+
+    await handler.async_pre_call_hook(
+        user_api_key_dict=user_api_key_dict,
+        cache=local_cache,
+        data=data,
+        call_type="pass_through_endpoint",
+    )
+    assert handler._gauge_in_flight_from_cache_value(
+        await local_cache.async_get_cache(key=parallel_key)
+    ) == 1
+
+    await handler.async_post_call_success_hook(
+        data=data,
+        user_api_key_dict=user_api_key_dict,
+        response=ModelResponse(),
+    )
+    assert handler._gauge_in_flight_from_cache_value(
+        await local_cache.async_get_cache(key=parallel_key)
+    ) == 0
+
+    await handler.async_log_success_event(
+        kwargs={"litellm_call_id": data["litellm_call_id"]},
+        response_obj=None,
+        start_time=None,
+        end_time=None,
+    )
+    assert handler._gauge_in_flight_from_cache_value(
+        await local_cache.async_get_cache(key=parallel_key)
+    ) == 0
+
+
 async def _build_seeded_limiter():
     """Build a v3 limiter whose api-key slot registry already holds the pre-call slot."""
     api_key = hash_token("sk-disconnect")
