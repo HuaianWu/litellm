@@ -1,6 +1,7 @@
 import asyncio
 import traceback
-from datetime import datetime
+from collections.abc import Mapping
+from datetime import datetime, timezone
 from typing import Any, Final, cast
 
 import litellm
@@ -56,6 +57,31 @@ _CAPTURED_IDENTITY_CALL_TYPES: Final[frozenset[str]] = frozenset(
         str(CallTypes.aretrieve_batch),
     )
 )
+
+
+def _datetime_from_logging_value(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    return None
+
+
+def _get_failure_log_times(request_data: Mapping[str, object]) -> tuple[datetime, datetime]:
+    logging_obj: Final = request_data.get("litellm_logging_obj")
+    logging_obj_start: Final = _datetime_from_logging_value(getattr(logging_obj, "start_time", None))
+    if logging_obj_start is not None:
+        return logging_obj_start, datetime.now(tz=logging_obj_start.tzinfo)
+
+    standard_logging_object: Final = request_data.get("standard_logging_object")
+    if isinstance(standard_logging_object, Mapping):
+        standard_start: Final = _datetime_from_logging_value(standard_logging_object.get("startTime"))
+        standard_end: Final = _datetime_from_logging_value(standard_logging_object.get("endTime"))
+        if standard_start is not None:
+            return standard_start, standard_end or datetime.now(tz=standard_start.tzinfo)
+
+    now: Final = datetime.now()
+    return now, now
 
 
 class _ProxyDBLogger(CustomLogger):
@@ -172,13 +198,7 @@ class _ProxyDBLogger(CustomLogger):
             if request_data.get("litellm_trace_id") is None:
                 request_data["litellm_trace_id"] = getattr(_litellm_logging_obj, "litellm_trace_id", None)
 
-        # Use the actual request start time from the logging object so that
-        # failed requests record the real duration instead of 0.
-        actual_start_time = datetime.now()
-        if _litellm_logging_obj is not None:
-            obj_start: Final = getattr(_litellm_logging_obj, "start_time", None)
-            if obj_start is not None:
-                actual_start_time = obj_start
+        actual_start_time, actual_end_time = _get_failure_log_times(request_data)
 
         # A stream that broke mid-flight still billed the provider for the
         # chunks already delivered. ``post_call_failure_hook`` lifts that
@@ -203,7 +223,7 @@ class _ProxyDBLogger(CustomLogger):
             kwargs=request_data,
             completion_response=original_exception,
             start_time=actual_start_time,
-            end_time=datetime.now(),
+            end_time=actual_end_time,
             org_id=user_api_key_dict.org_id,
         )
 

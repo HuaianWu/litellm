@@ -1280,6 +1280,46 @@ async def test_async_post_call_failure_hook_uses_actual_start_time():
         assert duration >= 55, f"Duration should be ~60s, got {duration}s"
 
 
+@pytest.mark.asyncio
+async def test_async_post_call_failure_hook_uses_lifted_standard_logging_times():
+    from datetime import timezone
+
+    logger = _ProxyDBLogger()
+    user_api_key_dict = UserAPIKeyAuth(
+        api_key="test_api_key",
+        user_id="test_user_id",
+        team_id="test_team_id",
+    )
+    start_time = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    end_time = datetime(2026, 9, 18, 12, 1, 30, tzinfo=timezone.utc)
+    request_data = {
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "Hello"}],
+        "metadata": {},
+        "proxy_server_request": {},
+        "standard_logging_object": {
+            "startTime": start_time.timestamp(),
+            "endTime": end_time.timestamp(),
+            "trace_id": "trace-504",
+        },
+    }
+
+    with patch(
+        "litellm.proxy.db.db_spend_update_writer.DBSpendUpdateWriter.update_database",
+        new_callable=AsyncMock,
+    ) as mock_update_database:
+        await logger.async_post_call_failure_hook(
+            request_data=request_data,
+            original_exception=Exception("504 Gateway Time-out"),
+            user_api_key_dict=user_api_key_dict,
+        )
+
+        call_args = mock_update_database.call_args[1]
+        assert call_args["start_time"] == start_time
+        assert call_args["end_time"] == end_time
+        assert call_args["kwargs"]["standard_logging_object"]["trace_id"] == "trace-504"
+
+
 async def _invoke_failure_hook_with_raised_exception():
     """Run the failure hook with an exception that has a real ``__traceback__``.
 
