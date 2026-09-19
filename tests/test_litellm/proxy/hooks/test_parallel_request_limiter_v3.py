@@ -10,6 +10,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -4225,6 +4226,113 @@ async def test_redis_release_script_updates_local_mirror_v3():
     )
     assert captured_calls == [([counter_key], ["slot-redis-test"])]
     assert await local_cache.async_get_cache(key=counter_key) == 2
+
+
+def _redis_recovery_handler(acquire, release):
+    from litellm.proxy.hooks.parallel_request_limiter_v3 import PARALLEL_ACQUIRE_SCRIPT, PARALLEL_RELEASE_SCRIPT
+
+    backend = MagicMock()
+    scripts = {PARALLEL_ACQUIRE_SCRIPT: acquire, PARALLEL_RELEASE_SCRIPT: release}
+    backend.async_register_script.side_effect = lambda script: scripts.get(script, AsyncMock(return_value=[]))
+    cache = DualCache(redis_cache=backend)
+    return _PROXY_MaxParallelRequestsHandler(InternalUsageCache(cache)), cache
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote_count,expected", [(0, "OK"), (8, "OVER_LIMIT")])
+async def test_redis_parallel_recovery_uses_authoritative_count(remote_count, expected):
+    acquire = AsyncMock(return_value=[0, 1] if remote_count == 0 else [1, 1, 8, 8])
+    handler, cache = _redis_recovery_handler(acquire, AsyncMock(return_value=[0]))
+    await cache.async_set_cache(key="gauge", value=8 if remote_count == 0 else 0, local_only=True)
+    response = await handler._check_parallel_request_gauges(
+        [{"counter_key": "gauge", "limit": 8, "descriptor_key": "api_key"}], "next"
+    )
+    assert response["overall_code"] == expected
+    acquire.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ConnectionError("No connection available."), asyncio.CancelledError()])
+async def test_redis_parallel_recovery_retries_failed_release(failure):
+    release = AsyncMock(side_effect=[failure, [0]])
+    handler, cache = _redis_recovery_handler(AsyncMock(return_value=[0, 1]), release)
+    await cache.async_set_cache(key="gauge", value=1, local_only=True)
+    stash = RequestRateLimiterStash(parallel_slot={"slot_id": "completed", "counter_keys": ["gauge"]})
+    if isinstance(failure, asyncio.CancelledError):
+        with pytest.raises(asyncio.CancelledError):
+            await handler._release_stashed_parallel_slot(stash, None)
+    else:
+        await handler._release_stashed_parallel_slot(stash, None)
+        assert stash.parallel_slot is None
+    assert "completed" in handler._pending_parallel_releases
+    retry_task = handler._parallel_release_retry_task
+    assert retry_task is not None
+    await asyncio.wait_for(retry_task, timeout=3)
+    assert release.await_count == 2
+    assert release.await_args_list[0] == release.await_args_list[1]
+    assert not handler._pending_parallel_releases
+
+
+@pytest.mark.asyncio
+async def test_redis_parallel_recovery_cleans_cancelled_acquire():
+    release = AsyncMock(return_value=[0])
+    handler, _ = _redis_recovery_handler(AsyncMock(side_effect=asyncio.CancelledError()), release)
+    with pytest.raises(asyncio.CancelledError):
+        await handler._check_parallel_request_gauges(
+            [{"counter_key": "gauge", "limit": 8, "descriptor_key": "api_key"}], "cancelled"
+        )
+    retry_task = handler._parallel_release_retry_task
+    assert retry_task is not None
+    await asyncio.wait_for(retry_task, timeout=3)
+    release.assert_awaited_once_with(keys=["gauge"], args=["cancelled"])
+
+
+@pytest.mark.asyncio
+async def test_redis_parallel_recovery_flushes_before_first_new_acquire():
+    operations = []
+
+    async def release(keys, args):
+        operations.append("release")
+        return [0]
+
+    async def acquire(keys, args):
+        operations.append("acquire")
+        return [0, 1] if operations[0] == "release" else [1, 1, 8, 8]
+
+    handler, cache = _redis_recovery_handler(acquire, release)
+    await cache.async_set_cache(key="gauge", value=8, local_only=True)
+    handler._queue_parallel_release({"slot_id": "completed", "counter_keys": ["gauge"]})
+    response = await handler._check_parallel_request_gauges(
+        [{"counter_key": "gauge", "limit": 8, "descriptor_key": "api_key"}], "next"
+    )
+    assert response["overall_code"] == "OK"
+    assert operations == ["release", "acquire"]
+    assert not handler._pending_parallel_releases
+    await asyncio.wait_for(handler._parallel_release_retry_task, timeout=3)
+
+
+@pytest.mark.asyncio
+async def test_completed_stream_releases_slot_without_logging_callbacks_v3():
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+    limiter, cache, counter_key, auth = await _build_seeded_limiter()
+    logging_obj = ProxyLogging(user_api_key_cache=DualCache())
+    logging_obj.proxy_hook_mapping["parallel_request_limiter"] = limiter
+    get_or_create_request_stash().parallel_slot = ParallelSlotAcquisition(
+        slot_id=_TEST_SLOT_ID, counter_keys=[counter_key]
+    )
+
+    async def upstream():
+        yield ModelResponse()
+
+    with _override_litellm_callbacks([]):
+        async for _ in ProxyBaseLLMRequestProcessing.async_sse_data_generator(
+            response=upstream(), user_api_key_dict=auth,
+            request_data={"model": "test"}, proxy_logging_obj=logging_obj,
+        ):
+            pass
+    assert limiter._gauge_in_flight_from_cache_value(await cache.async_get_cache(key=counter_key)) == 0
+    assert get_request_stash().parallel_slot is None
 
 
 @pytest.mark.asyncio

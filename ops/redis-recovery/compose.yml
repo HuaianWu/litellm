@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab-isolated-only
+      POSTGRES_DB: lab
+    mem_limit: 768m
+    cpus: 1
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U lab -d lab]
+      interval: 2s
+      retries: 30
+  redis:
+    image: redis@sha256:9d317178eceac8454a2284a9e6df2466b93c745529947f0cd42a0fa9609d7005
+    mem_limit: 256m
+    cpus: 1
+  mock:
+    image: litellm-local:1.99.1-no-shadow-pr40387-pr40843-504-timing-d1bd21e0
+    entrypoint: [python, /lab/mock.py]
+    volumes: ["./:/lab:ro"]
+    mem_limit: 256m
+    cpus: 1
+  proxy:
+    image: litellm-local:1.99.1-no-shadow-pr40387-pr40843-504-timing-d1bd21e0
+    environment:
+      DATABASE_URL: postgresql://lab:lab-isolated-only@db:5432/lab
+      LITELLM_MASTER_KEY: sk-redis-lab-only
+      PYTHONPATH: /lab
+      LITELLM_LOCAL_MODEL_COST_MAP: "true"
+    command: ["--config", /lab/config.yaml, "--port", "4000"]
+    ports: ["127.0.0.1:14091:4000"]
+    volumes: ["./:/lab:ro"]
+    mem_limit: 3g
+    cpus: 2
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      mock:
+        condition: service_started
+networks:
+  default:
+    internal: true

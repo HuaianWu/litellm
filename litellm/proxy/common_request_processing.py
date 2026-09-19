@@ -3330,6 +3330,11 @@ class ProxyBaseLLMRequestProcessing:
         proxy_logging_obj: ProxyLogging | None = None,
     ) -> None:
         with anyio.CancelScope(shield=True):
+            if proxy_logging_obj is not None and user_api_key_dict is not None:
+                try:
+                    await proxy_logging_obj._arelease_max_parallel_requests_on_disconnect(user_api_key_dict)
+                except Exception as exc:  # noqa: BLE001  # slot cleanup must not prevent closing the upstream stream
+                    verbose_proxy_logger.exception("Error releasing completed stream's parallel slot: %s", exc)
             should_record_client_disconnect: Final = client_disconnected or (not stream_completed)
             recorded_client_disconnect = False
             if should_record_client_disconnect:
@@ -3341,24 +3346,8 @@ class ProxyBaseLLMRequestProcessing:
             if recorded_client_disconnect:
                 deferred_stream_logging_armed: Final = _deferred_stream_logging_is_armed(request_data)
                 ProxyLogging._fire_deferred_stream_logging(request_data)
-                # A disconnect-time success event (the deferred-guardrail flush
-                # above, or the partial-spend billing below) releases the
-                # request's max_parallel_requests slot through the limiter's
-                # own success callback. Release the slot explicitly only when
-                # no such event fires, so exactly one release happens; two
-                # concurrent releases would race and double-decrement under the
-                # limiter's in-memory fallback.
-                success_event_owns_slot_release = deferred_stream_logging_armed
                 if not deferred_stream_logging_armed:
-                    success_event_owns_slot_release = await _bill_partial_streamed_spend_on_disconnect(
-                        request_data, response
-                    )
-                if (
-                    not success_event_owns_slot_release
-                    and proxy_logging_obj is not None
-                    and user_api_key_dict is not None
-                ):
-                    await proxy_logging_obj._arelease_max_parallel_requests_on_disconnect(user_api_key_dict)
+                    await _bill_partial_streamed_spend_on_disconnect(request_data, response)
 
             if hasattr(response, "aclose"):
                 try:

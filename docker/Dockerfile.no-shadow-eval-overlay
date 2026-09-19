@@ -7,6 +7,7 @@ COPY litellm/proxy/db/db_lookup_gate.py /app/.venv/lib/python3.13/site-packages/
 COPY litellm/proxy/db/spend_counter_reseed.py /app/.venv/lib/python3.13/site-packages/litellm/proxy/db/spend_counter_reseed.py
 COPY litellm/proxy/hooks/parallel_request_limiter_v3.py /app/.venv/lib/python3.13/site-packages/litellm/proxy/hooks/parallel_request_limiter_v3.py
 COPY litellm/proxy/hooks/proxy_track_cost_callback.py /app/.venv/lib/python3.13/site-packages/litellm/proxy/hooks/proxy_track_cost_callback.py
+COPY litellm/proxy/common_request_processing.py /app/.venv/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py
 
 RUN python -m py_compile \
     /app/.venv/lib/python3.13/site-packages/litellm/constants.py \
@@ -15,4 +16,5 @@ RUN python -m py_compile \
     /app/.venv/lib/python3.13/site-packages/litellm/proxy/db/db_lookup_gate.py \
     /app/.venv/lib/python3.13/site-packages/litellm/proxy/db/spend_counter_reseed.py \
     /app/.venv/lib/python3.13/site-packages/litellm/proxy/hooks/parallel_request_limiter_v3.py \
-    /app/.venv/lib/python3.13/site-packages/litellm/proxy/hooks/proxy_track_cost_callback.py
+    /app/.venv/lib/python3.13/site-packages/litellm/proxy/hooks/proxy_track_cost_callback.py \
+    /app/.venv/lib/python3.13/site-packages/litellm/proxy/common_request_processing.py

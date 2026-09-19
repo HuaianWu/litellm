@@ -6,6 +6,7 @@ This is currently in development and not yet ready for production.
 
 import asyncio
 import binascii
+import contextvars
 import os
 import uuid
 from collections.abc import Callable, Mapping, Sequence, Set
@@ -645,6 +646,8 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
         # follow-up because Lua dominates wall-time and the lock is held for
         # one round-trip.
         self._check_and_increment_lock = asyncio.Lock()
+        self._pending_parallel_releases: dict[str, tuple[ParallelSlotAcquisition, float]] = {}
+        self._parallel_release_retry_task: asyncio.Task[None] | None = None
 
     def _get_batch_rate_limiter(self) -> CallTypeRateLimiter | None:
         """Get or lazy-load the batch rate limiter."""
@@ -1470,26 +1473,26 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                 statuses.append(self._gauge_status(gauge, in_flight, code))
             return RateLimitResponse(overall_code=overall_code, statuses=statuses)
 
-        local_counts: Final = await self._read_local_gauge_counts(gauge_keys, parent_otel_span)
-        for gauge, in_flight in zip(gauges, local_counts):
-            if in_flight >= gauge["limit"]:
-                return RateLimitResponse(
-                    overall_code="OVER_LIMIT",
-                    statuses=[self._gauge_status(gauge, in_flight, "OVER_LIMIT")],
-                )
-
         if self.parallel_acquire_script is not None:
             try:
+                if self._pending_parallel_releases:
+                    await self._flush_pending_parallel_releases(gauge_keys)
                 raw: Final[list[CacheCounterValue]] = await self.parallel_acquire_script(
                     keys=gauge_keys,
                     args=[
                         arg for gauge in gauges for arg in (gauge["limit"], PARALLEL_REQUEST_SLOT_TTL_SECONDS, slot_id)
                     ],
                 )
+            except asyncio.CancelledError:
+                self._queue_parallel_release(ParallelSlotAcquisition(slot_id=slot_id, counter_keys=gauge_keys))
+                raise
             except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to in-memory enforcement, never a 500
                 verbose_proxy_logger.warning("parallel_acquire_script failed, falling back to in-memory gauge: %s", e)
                 async with self._check_and_increment_lock:
-                    return await self._acquire_parallel_slots_in_memory(gauges, slot_id, parent_otel_span)
+                    fallback: Final = await self._acquire_parallel_slots_in_memory(gauges, slot_id, parent_otel_span)
+                if fallback["overall_code"] == "OVER_LIMIT":
+                    self._queue_parallel_release(ParallelSlotAcquisition(slot_id=slot_id, counter_keys=gauge_keys))
+                return fallback
             if int(raw[0]) == 1:
                 gauge = gauges[int(raw[1]) - 1]
                 return RateLimitResponse(
@@ -1594,6 +1597,52 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
             await self._release_parallel_request_slots(acquisition, parent_otel_span)
             stash.parallel_slot = None  # rebind-ok: marks this request's slot as released
 
+    def _queue_parallel_release(self, acquisition: ParallelSlotAcquisition) -> None:
+        if self.parallel_release_script is None:
+            return
+        self._pending_parallel_releases.setdefault(
+            acquisition["slot_id"],
+            (acquisition, asyncio.get_running_loop().time() + PARALLEL_REQUEST_SLOT_TTL_SECONDS),
+        )
+        if self._parallel_release_retry_task is None or self._parallel_release_retry_task.done():
+            self._parallel_release_retry_task = contextvars.Context().run(
+                asyncio.create_task, self._retry_pending_parallel_releases()
+            )
+
+    async def _retry_pending_parallel_releases(self) -> None:
+        try:
+            while self._pending_parallel_releases:
+                await asyncio.sleep(1)
+                await self._flush_pending_parallel_releases()
+        finally:
+            self._parallel_release_retry_task = None
+
+    async def _flush_pending_parallel_releases(self, counter_keys: Sequence[str] | None = None) -> None:
+        release_script: Final = self.parallel_release_script
+        if release_script is None:
+            return
+        pending: Final = tuple(
+            (slot_id, entry)
+            for slot_id, entry in self._pending_parallel_releases.items()
+            if counter_keys is None or any(key in counter_keys for key in entry[0]["counter_keys"])
+        )[:100]
+        for slot_id, (acquisition, deadline) in pending:
+            if asyncio.get_running_loop().time() >= deadline:
+                self._pending_parallel_releases.pop(slot_id, None)
+                continue
+            try:
+                await asyncio.wait_for(
+                    release_script(
+                        keys=acquisition["counter_keys"],
+                        args=[slot_id for _ in acquisition["counter_keys"]],
+                    ),
+                    timeout=5,
+                )
+            except Exception as exc:  # noqa: BLE001  # Redis transport and Lua errors retain the release for retry
+                verbose_proxy_logger.debug("Retrying deferred parallel slot release: %s", exc)
+                break
+            self._pending_parallel_releases.pop(slot_id, None)
+
     async def _release_parallel_request_slots(
         self,
         acquisition: ParallelSlotAcquisition,
@@ -1625,8 +1674,13 @@ class _PROXY_MaxParallelRequestsHandler_v3(CustomLogger):
                         litellm_parent_otel_span=parent_otel_span,
                         local_only=True,
                     )
+                self._pending_parallel_releases.pop(slot_id, None)
                 return
+            except asyncio.CancelledError:
+                self._queue_parallel_release(acquisition)
+                raise
             except Exception as e:  # noqa: BLE001 - any Redis/Lua failure degrades to the in-memory release, never a 500
+                self._queue_parallel_release(acquisition)
                 verbose_proxy_logger.warning("parallel_release_script failed, falling back to in-memory release: %s", e)
 
         async with self._check_and_increment_lock:

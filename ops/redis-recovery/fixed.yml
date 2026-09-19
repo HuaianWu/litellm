@@ -1,0 +1,3 @@
+services:
+  proxy:
+    image: litellm-local:1.99.1-redis-recovery-candidate

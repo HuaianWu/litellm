@@ -5527,14 +5527,7 @@ class TestStreamingClientDisconnectBilling:
         assert standard_logging_object["total_tokens"] > 0
 
     @pytest.mark.asyncio
-    async def test_disconnect_billing_does_not_double_release_slot(self):
-        """
-        The disconnect billing fires a success event whose limiter callback
-        already releases the max_parallel_requests slot. The shielded cleanup
-        must therefore NOT also release the slot explicitly; two releases of
-        the same acquisition race and double-decrement under the limiter's
-        in-memory fallback.
-        """
+    async def test_disconnect_billing_does_not_delay_slot_release(self):
         import types
 
         original_callbacks = litellm.callbacks
@@ -5562,7 +5555,7 @@ class TestStreamingClientDisconnectBilling:
         finally:
             litellm.callbacks = original_callbacks
 
-        proxy_logging_obj._arelease_max_parallel_requests_on_disconnect.assert_not_called()
+        proxy_logging_obj._arelease_max_parallel_requests_on_disconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_disconnect_without_billable_chunks_releases_slot(self):
